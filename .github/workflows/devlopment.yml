@@ -10,7 +10,7 @@
     call-reusable:
       name: Call Reusable Next.js CI Workflow
       # or use the shared repo like uses: your-org/shared-repo/.github/workflows/nextjs-reusable-ci.yml@main
-      uses: ./.github/workflows/reuseable-nextjs-ci.yml
+      uses: ./.github/workflows/reuseablenext-workflow.yml
       with:
         node-version: '18'
         environment_name: 'development'
