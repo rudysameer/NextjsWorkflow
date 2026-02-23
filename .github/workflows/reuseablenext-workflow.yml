@@ -1,0 +1,165 @@
+name: Reuseable Next.js CI Workflow
+
+on:
+  workflow_call:
+    # Definin the inputs that the calling workflow must provide
+    inputs:
+      environment_name:
+        description: 'Deployment environment (e.g., development, staging, production)'
+        required: true
+        type: string
+
+      node-version:
+        description: 'Node.js version to use for the build'
+        required: true
+        type: string
+        default: '18'
+
+
+jobs:
+  deploy:
+    name: Build and Test According to Environment
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment_name }} # development, staging, production
+    timeout-minutes: 45
+    env:
+      NEXT_TELEMETRY_DISABLED: 1
+      REPO_NAME: ${{ github.event.repository.name }} # myabroadfriend
+
+    steps:
+      - name: 1. Checkout code
+        uses: actions/checkout@v4
+
+      # created .env.local according to the environment. for devlopment, staging and production.
+      # This file is required for next.js build if you are using environment variables in your code.
+      - name: Create .env.local file
+        run: |
+          echo "${{ secrets.ENV_FILE_CONTENT }}" >> .env.local
+       #   echo "NODE_ENV=${{ inputs.environment_name }}" > .env.local
+       #   echo "DB_USER=${{ secrets.DB_USER }}" >> .env.local 
+       #   echo "DB_PASSWORD=${{ secrets.DB_PASSWORD }}" >> .env.local
+       #   echo "NEXT_PUBLIC_API_URL=${{ secrets.NEXT_PUBLIC_API_URL }}" >> .env.local
+        # or we can simply use echo "${{ secrets.ENV_FILE_CONTENT }}" >> .env.local
+
+      - name: 2. Set up Node.js
+        uses : actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: 3. Install dependencies
+        run: npm ci
+
+      - name: 4. Run ESLint
+        run: npm run lint
+
+      - name: 5. Run tests
+        run: npm test
+
+      - name: 6. Build application
+        run: npm run build
+
+      - name: Create clean deployment copy
+        run: |
+          mkdir -p /tmp/deploy
+
+          rsync -av \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='README.md' \
+            --exclude='*.log' \
+            --exclude='.DS_Store' \
+            --exclude='coverage' \
+            --exclude='.nyc_output' \
+            --exclude='__tests__' \
+            --exclude='__mocks__' \
+            --exclude='*.test.*' \
+            --exclude='*.spec.*' \
+            --exclude='.vscode' \
+            --exclude='.idea' \
+            --exclude='*.tmp' \
+            --exclude='*.temp' \
+            --exclude='node_modules' \
+            ./ /tmp/deploy/
+
+
+      - name: 7. Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || {
+            echo "Warning: Could not add server to known_hosts via ssh-keyscan"
+            echo "Will rely on StrictHostKeyChecking=no"
+          }
+          if [ -f ~/.ssh/known_hosts ]; then
+            chmod 644 ~/.ssh/known_hosts
+          fi
+
+
+      - name: Test SSH Connection
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+            -o ConnectTimeout=10 \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
+            ${{ secrets.SERVER_USERNAME }}@${{ secrets.SERVER_HOST }} \
+            "echo 'SSH connection successful'"
+
+      - name: 7. Prepare deployment directory on server
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            ${{ secrets.SERVER_USERNAME }}@${{ secrets.SERVER_HOST }} \
+            "mkdir -p '/home/${{ secrets.SERVER_USERNAME }}/${{ env.REPO_NAME }}'
+            "
+
+      - name: 8. Deploy files to server via rsync
+        run: |
+          rsync -avz --delete \
+          --progress \
+          --human-readable \
+          -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" -o LogLevel=ERROR \
+            /tmp/deploy/ \
+            ${{ secrets.SERVER_USERNAME}}@${{ secrets.SERVER_HOST }}:/home/${{ secrets.SERVER_USERNAME }}/${{env.REPO_NAME }}/
+
+      
+      - name: Install production deps & restart PM2 application on the server
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            ${{ secrets.SERVER_USERNAME }}@${{ secrets.SERVER_HOST }} \
+            "set -e 
+            cd '/home/${{ secrets.SERVER_USERNAME }}/${{ env.REPO_NAME }}'
+
+            export NVM_DIR=\"/home/${{ secrets.SERVER_USERNAME }}/.nvm\"
+            if [ -s \"\$NVM_DIR/nvm.sh\" ]; then
+            source \"\$NVM_DIR/nvm.sh\"
+            fi
+
+            npm ci --only=production --silent
+
+            if ! command -v pm2 &> /dev/null; then
+              npm install -g pm2
+            fi
+
+            if pm2 list | grep -q \"${{env.REPO_NAME}}\"; then
+              pm2 reload \"${{env.REPO_NAME}}\" --update-env
+            else
+              PORT=${{ secrets.PORT }} pm2 start npm --name \"${{ env.REPO_NAME }}\" -- start
+            fi
+             
+            pm2 save
+            pm2 list
+            "
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f ~/.ssh/deploy_key
+          rm -rf /tmp/deploy
+
+      

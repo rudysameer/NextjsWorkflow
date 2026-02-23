@@ -1,0 +1,15 @@
+name: production CI Pipeline
+
+# Trigger workflow on push request to the production branch
+on:
+  push:
+    branches:
+      - "main"
+
+jobs:
+  call-reusable:
+    name: Call Reusable Next.js CI Workflow
+    uses: ./.github/workflows/reuseable-nextjs-ci.yml
+    with:
+      node-version: '18'
+      environment_name: 'production'
